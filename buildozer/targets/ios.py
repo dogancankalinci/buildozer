@@ -4,6 +4,7 @@ iOS target, based on kivy-ios project
 
 
 from getpass import getpass
+from glob import glob
 from os.path import join, basename, expanduser, realpath
 import plistlib
 import sys
@@ -11,53 +12,6 @@ import sys
 import buildozer.buildops as buildops
 from buildozer.exceptions import BuildozerCommandException
 from buildozer.target import Target, no_config
-
-
-PHP_TEMPLATE = '''
-<?php
-// credits goes to http://jeffreysambells.com/2010/06/22/ios-wireless-app-distribution
-
-$ipas = glob('*.ipa');
-$provisioningProfiles = glob('*.mobileprovision');
-$plists = glob('*.plist');
-
-$sr = stristr( $_SERVER['SCRIPT_URI'], '.php' ) === false ?
-    $_SERVER['SCRIPT_URI'] : dirname($_SERVER['SCRIPT_URI']) . '/';
-$provisioningProfile = $sr . $provisioningProfiles[0];
-$ipa = $sr . $ipas[0];
-$itmsUrl = urlencode( $sr . 'index.php?plist=' . str_replace( '.plist', '', $plists[0] ) );
-
-
-if ($_GET['plist']) {
-    $plist = file_get_contents( dirname(__FILE__)
-        . DIRECTORY_SEPARATOR
-        . preg_replace( '/![A-Za-z0-9-_]/i', '', $_GET['plist']) . '.plist' );
-    $plist = str_replace('_URL_', $ipa, $plist);
-    header('content-type: application/xml');
-    echo $plist;
-    die();
-}
-
-
-?><!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"
-        "http://www.w3.org/TR/html4/loose.dtd">
-<html>
-<head>
-<title>Install {appname}</title>
-<style type="text/css">
-li { padding: 1em; }
-</style>
-
-</head>
-<body>
-<ul>
-    <li><a href="<? echo $provisioningProfile; ?>">Install Team Provisioning File</a></li>
-    <li><a href="itms-services://?action=download-manifest&url=<? echo $itmsUrl; ?>">
-         Install Application</a></li>
-</ul>
-</body>
-</html>
-'''
 
 
 class TargetIos(Target):
@@ -141,15 +95,125 @@ class TargetIos(Target):
             **kwargs)
 
     @property
-    def code_signing_allowed(self):
-        allowed = self.buildozer.config.getboolean("app", "ios.codesign.allowed")
-        allowed = "YES" if allowed else "NO"
-        return f"CODE_SIGNING_ALLOWED={allowed}"
+    def code_signing_enabled(self):
+        return self.buildozer.config.getboolean("app", "ios.codesign.allowed")
 
     @property
-    def code_signing_development_team(self):
-        team = self.buildozer.config.get("app", f"ios.codesign.development_team.{self.build_mode}", fallback=None)
-        return f"DEVELOPMENT_TEAM={team}" if team else None
+    def code_signing_allowed(self):
+        return "CODE_SIGNING_ALLOWED={}".format(
+            "YES" if self.code_signing_enabled else "NO")
+
+    @property
+    def code_signing_style(self):
+        """Configured signing style for the current build mode, either
+        "automatic" or "manual".
+
+        "automatic" lets Xcode resolve certificates/profiles through an active
+        Apple ID session and therefore cannot be used on headless CI; "manual"
+        relies on explicitly provided certificate and provisioning profile.
+        """
+        key = "ios.codesign.style.{}".format(self.build_mode)
+        style = self.buildozer.config.get(
+            "app", key, fallback="automatic").lower()
+        if style not in ("automatic", "manual"):
+            self.logger.error(
+                'Invalid {} "{}", falling back to "automatic". '
+                'Valid values are "automatic" or "manual".'.format(key, style))
+            style = "automatic"
+        return style
+
+    def _get_code_sign_identity(self):
+        """Return the signing certificate name for the current build mode.
+
+        The value is stripped of any surrounding quotes because these arguments
+        are passed straight to a subprocess (there is no shell to unquote them).
+        """
+        key = "ios.codesign.{}".format(self.build_mode)
+        identity = self.buildozer.config.get("app", key, fallback="")
+        if (len(identity) >= 2 and identity[0] in ('"', "'")
+                and identity[-1] == identity[0]):
+            identity = identity[1:-1]
+        return identity
+
+    def _get_provisioning_profile(self):
+        """Return the provisioning profile (name or UUID) configured for the
+        current build mode. Only relevant for manual signing."""
+        key = "ios.codesign.provisioning_profile.{}".format(self.build_mode)
+        return self.buildozer.config.get("app", key, fallback="")
+
+    def _get_signing_build_settings(self):
+        """Return the xcodebuild build settings for the ``clean build`` and
+        ``archive`` steps.
+
+        When code signing is disabled (``ios.codesign.allowed = false``) no
+        signing settings are returned at all: the build is unsigned and only
+        ``CODE_SIGNING_ALLOWED=NO`` (passed separately) is given to xcodebuild.
+
+        When signing is enabled, ``CODE_SIGN_STYLE`` is always passed explicitly
+        so the build does not silently depend on whatever value happens to be
+        saved in the generated ``.xcodeproj``. Manual signing (the only style
+        usable on headless CI, where there is no Apple ID session) additionally
+        pins the certificate and the provisioning profile.
+        """
+        if not self.code_signing_enabled:
+            return []
+        settings = []
+        team = self.buildozer.config.get(
+            "app", "ios.codesign.development_team.{}".format(self.build_mode),
+            fallback=None)
+        if team:
+            settings.append("DEVELOPMENT_TEAM={}".format(team))
+        if self.code_signing_style == "manual":
+            settings.append("CODE_SIGN_STYLE=Manual")
+            identity = self._get_code_sign_identity()
+            if identity:
+                settings.append("CODE_SIGN_IDENTITY={}".format(identity))
+            profile = self._get_provisioning_profile()
+            if profile:
+                settings.append(
+                    "PROVISIONING_PROFILE_SPECIFIER={}".format(profile))
+        else:
+            settings.append("CODE_SIGN_STYLE=Automatic")
+        return settings
+
+    def _validate_export_signing(self):
+        """Check the configuration is sufficient to sign and export an IPA.
+
+        Signing is only validated when it is enabled; with signing disabled
+        there is nothing to sign, so the configuration is ignored until the
+        export step. Automatic signing lets Xcode resolve the certificate and
+        provisioning profile via the Apple ID session, but still needs a
+        development team. Manual signing has no such fallback and needs a
+        signing identity and a provisioning profile (the team is carried by the
+        profile). An error is logged for each missing token.
+        """
+        if not self.code_signing_enabled:
+            return True
+        if self.code_signing_style != "manual":
+            # Automatic signing still needs to know which Developer Team to use;
+            # without it xcodebuild fails with "requires a development team".
+            team_key = "ios.codesign.development_team.{}".format(self.build_mode)
+            if not self.buildozer.config.get("app", team_key, fallback=""):
+                self.logger.error(
+                    'Automatic code signing requires a development team. '
+                    'You must fill the "{}" token.'.format(team_key))
+                return False
+            return True
+        ok = True
+        identity_key = "ios.codesign.{}".format(self.build_mode)
+        if not self.buildozer.config.get("app", identity_key, fallback=""):
+            self.logger.error(
+                'Manual code signing requires a signing certificate. '
+                'You must fill the "{}" token.'.format(identity_key))
+            ok = False
+        if not self._get_provisioning_profile():
+            profile_key = "ios.codesign.provisioning_profile.{}".format(
+                self.build_mode)
+            self.logger.error(
+                'Manual code signing requires a provisioning profile. '
+                'You must fill the "{}" token.'.format(profile_key))
+            ok = False
+        return ok
 
     def get_available_packages(self):
         available_modules = self.toolchain(["recipes", "--compact"], get_stdout=True)[0]
@@ -214,6 +278,13 @@ class TargetIos(Target):
         return package.lower()
 
     def build_package(self):
+        # Fail fast on an incomplete manual-signing configuration: the
+        # `clean build` and `archive` steps below already consume the signing
+        # identity/profile, so validating up front gives a clear message instead
+        # of a cryptic xcodebuild failure.
+        if not self._validate_export_signing():
+            return
+
         self._unlock_keychain()
 
         # create the project
@@ -249,23 +320,6 @@ class TargetIos(Target):
         # add icons
         self._create_icons()
 
-        # Generate OTA distribution manifest if `app_url`, `display_image_url` and `full_size_image_url` are defined.
-        app_url = self.buildozer.config.get("app", "ios.manifest.app_url", fallback=None)
-        display_image_url = self.buildozer.config.get("app", "ios.manifest.display_image_url", fallback=None)
-        full_size_image_url = self.buildozer.config.get("app", "ios.manifest.full_size_image_url", fallback=None)
-
-        if any((app_url, display_image_url, full_size_image_url)):
-
-            if not all((app_url, display_image_url, full_size_image_url)):
-                self.logger.error("Options ios.manifest.app_url, ios.manifest.display_image_url"
-                                     " and ios.manifest.full_size_image_url should be defined all together")
-                return
-
-            plist['manifest'] = {
-                'appURL': app_url,
-                'displayImageURL': display_image_url,
-                'fullSizeImageURL': full_size_image_url,
-            }
         # Permissions and their Justification Descriptions
         local_network_usage_description = self.buildozer.config.get(
             "app", "ios.local_network_usage_description", fallback=None)
@@ -313,13 +367,18 @@ class TargetIos(Target):
         self.dump_plist_to_file(plist, plist_rfn)
 
         mode = self.build_mode.capitalize()
+        # Signing settings shared by the `clean build` and `archive` steps.
+        # When signing is disabled this list is empty, so only
+        # CODE_SIGNING_ALLOWED=NO is passed; otherwise CODE_SIGN_STYLE (and, for
+        # manual signing, the team/identity/profile) are pinned explicitly.
+        signing_build_settings = self._get_signing_build_settings()
         self.xcodebuild(
             "-configuration",
             mode,
             '-allowProvisioningUpdates',
             'ENABLE_BITCODE=NO',
             self.code_signing_allowed,
-            self.code_signing_development_team,
+            *signing_build_settings,
             'clean',
             'build',
             cwd=self.app_project_dir)
@@ -331,7 +390,6 @@ class TargetIos(Target):
         xcarchive = join(intermediate_dir, '{}-{}.xcarchive'.format(
             app_name, version))
         ipa_name = '{}-{}.ipa'.format(app_name, version)
-        ipa_tmp = join(intermediate_dir, ipa_name)
         ipa = join(self.buildozer.bin_dir, ipa_name)
         build_dir = join(self.ios_dir, '{}-ios'.format(app_name.lower()))
 
@@ -348,39 +406,145 @@ class TargetIos(Target):
             xcarchive,
             '-destination',
             'generic/platform=iOS',
+            '-allowProvisioningUpdates',
             'archive',
             'ENABLE_BITCODE=NO',
             self.code_signing_allowed,
-            self.code_signing_development_team,
+            *signing_build_settings,
             cwd=build_dir)
 
-        key = 'ios.codesign.{}'.format(self.build_mode)
-        ioscodesign = self.buildozer.config.get('app', key, fallback='')
-        if not ioscodesign:
-            self.logger.error('Cannot create the IPA package without'
-                ' signature. You must fill the "{}" token.'.format(key))
+        # An IPA cannot be exported without code signing enabled. The app has
+        # already been built at this point (so deploy/run still work), but stop
+        # before the export step with a clear message rather than letting
+        # xcodebuild fail trying to export an unsigned archive.
+        if not self.code_signing_enabled:
+            self.logger.error(
+                'Code signing is disabled (ios.codesign.allowed = false); '
+                'the app was built but no IPA can be produced. Set '
+                'ios.codesign.allowed = true to create a signed IPA.')
             return
-        elif ioscodesign[0] not in ('"', "'"):
-            ioscodesign = '"{}"'.format(ioscodesign)
+
+        # Export needs a dedicated ExportOptions.plist (NOT the app Info.plist),
+        # and every flag/value must be a separate argument because the command
+        # is run directly via subprocess (no shell to split arguments on spaces).
+        export_options_plist = self._generate_export_options_plist(
+            intermediate_dir)
+        export_dir = join(intermediate_dir, 'export')
 
         self.logger.info('Creating IPA...')
         self.xcodebuild(
             '-exportArchive',
-            f'-archivePath "{xcarchive}"',
-            f'-exportOptionsPlist "{plist_rfn}"',
-            f'-exportPath "{ipa_tmp}"',
-            f'CODE_SIGN_IDENTITY={ioscodesign}',
+            '-archivePath', xcarchive,
+            '-exportOptionsPlist', export_options_plist,
+            '-exportPath', export_dir,
             'ENABLE_BITCODE=NO',
             cwd=build_dir)
 
+        # xcodebuild writes the IPA (named after the scheme) into the export
+        # directory; locate it before moving it to the bin directory.
+        exported_ipas = glob(join(export_dir, '*.ipa'))
+        if not exported_ipas:
+            self.logger.error(
+                'Export finished but no .ipa was produced in {}'.format(
+                    export_dir))
+            return
+
         self.logger.info('Moving IPA to bin...')
-        buildops.rename(ipa_tmp, ipa)
+        buildops.rename(exported_ipas[0], ipa)
+
+        # Generate a standalone OTA (over-the-air) distribution manifest when
+        # the ios.manifest.* options are set. iOS reads OTA data from this
+        # dedicated plist hosted next to the IPA, never from the app Info.plist.
+        self._generate_ota_manifest(app_name, version)
 
         self.logger.info('iOS packaging done!')
         self.logger.info('IPA {0} available in the bin directory'.format(
             basename(ipa)))
         self.buildozer.state['ios:latestipa'] = ipa
         self.buildozer.state['ios:latestmode'] = self.build_mode
+
+    def _generate_export_options_plist(self, intermediate_dir):
+        """Create the ExportOptions.plist consumed by ``xcodebuild
+        -exportArchive``.
+
+        This is a distribution-options file (export method, team id, signing
+        style, ...) and must not be confused with the application Info.plist.
+        """
+        config = self.buildozer.config
+        style = self.code_signing_style
+        export_options = {
+            'method': config.get(
+                'app', 'ios.export_method.{}'.format(self.build_mode),
+                fallback='development'),
+            'signingStyle': style,
+        }
+        team = config.get(
+            'app', 'ios.codesign.development_team.{}'.format(self.build_mode),
+            fallback=None)
+        if team:
+            export_options['teamID'] = team
+        if style == 'manual':
+            identity = self._get_code_sign_identity()
+            if identity:
+                export_options['signingCertificate'] = identity
+            profile = self._get_provisioning_profile()
+            if profile:
+                export_options['provisioningProfiles'] = {
+                    self._get_package(): profile,
+                }
+        export_options_plist = join(intermediate_dir, 'ExportOptions.plist')
+        self.dump_plist_to_file(export_options, export_options_plist)
+        return export_options_plist
+
+    def _generate_ota_manifest(self, app_name, version):
+        """Write a standalone iTunes Services manifest plist into the bin
+        directory for OTA (over-the-air) distribution.
+
+        This is the file an ``itms-services://?action=download-manifest&url=...``
+        link must point at. It is only generated when the three ios.manifest.*
+        options are configured together.
+        """
+        config = self.buildozer.config
+        app_url = config.get('app', 'ios.manifest.app_url', fallback=None)
+        display_image_url = config.get(
+            'app', 'ios.manifest.display_image_url', fallback=None)
+        full_size_image_url = config.get(
+            'app', 'ios.manifest.full_size_image_url', fallback=None)
+
+        if not any((app_url, display_image_url, full_size_image_url)):
+            return
+
+        if not all((app_url, display_image_url, full_size_image_url)):
+            self.logger.error(
+                'Options ios.manifest.app_url, ios.manifest.display_image_url '
+                'and ios.manifest.full_size_image_url should be defined all '
+                'together; skipping OTA manifest generation.')
+            return
+
+        manifest = {
+            'items': [{
+                'assets': [
+                    {'kind': 'software-package', 'url': app_url},
+                    {'kind': 'display-image', 'needs-shine': False,
+                     'url': display_image_url},
+                    {'kind': 'full-size-image', 'needs-shine': False,
+                     'url': full_size_image_url},
+                ],
+                'metadata': {
+                    'bundle-identifier': self._get_package(),
+                    'bundle-version': version,
+                    'kind': 'software',
+                    'title': app_name,
+                },
+            }],
+        }
+        manifest_path = join(
+            self.buildozer.bin_dir,
+            '{}-{}-manifest.plist'.format(app_name, version))
+        self.dump_plist_to_file(manifest, manifest_path)
+        self.logger.info(
+            'OTA manifest available in the bin directory: {}'.format(
+                basename(manifest_path)))
 
     def cmd_deploy(self, *args):
         super().cmd_deploy(*args)

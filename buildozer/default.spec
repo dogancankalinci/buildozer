@@ -401,6 +401,28 @@ ios.codesign.allowed = false
 # (str) The development team to use for signing the release version
 #ios.codesign.development_team.release = <hexstring>
 
+# (str) Code signing style for the debug build, either "automatic" or "manual".
+# "automatic" lets Xcode resolve certificates and provisioning profiles through
+# an active Apple ID session; it is convenient locally but does NOT work on
+# headless CI. Use "manual" (with the identity and provisioning profile tokens)
+# for CI / unattended builds.
+ios.codesign.style.debug = automatic
+
+# (str) Code signing style for the release build, either "automatic" or "manual"
+ios.codesign.style.release = automatic
+
+# (str) Export method for the debug build: app-store, ad-hoc, enterprise or development
+ios.export_method.debug = development
+
+# (str) Export method for the release build: app-store, ad-hoc, enterprise or development
+ios.export_method.release = app-store
+
+# (str) Provisioning profile (name or UUID) for manual signing of the debug version
+#ios.codesign.provisioning_profile.debug = <UUID or profile name>
+
+# (str) Provisioning profile (name or UUID) for manual signing of the release version
+#ios.codesign.provisioning_profile.release = <UUID or profile name>
+
 # (str) Justification text to be provided for being able to select media
 #ios.media_usage_description = "<APP> needs to access your media in order to <Do X and Y and Z> "
 
